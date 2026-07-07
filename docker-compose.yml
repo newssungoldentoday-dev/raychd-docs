@@ -1,0 +1,131 @@
+version: "3.8"
+
+# ---------------------------------------------------------------------------
+# Ray Chad — full stack
+#
+# This compose file brings up the whole Ray Chad ecosystem on one machine:
+#   1. raychd        — the InspIRCd server itself (plaintext + TLS ports)
+#   2. raychd-forum   — the companion PHP/SQLite forum, backed by a small
+#                        Node.js API (express + better-sqlite3 + irc-framework)
+#                        that bridges forum activity with the IRC network
+#   3. raychd-docs    — this docs site, served as static files via nginx
+#
+# All three share a private bridge network (`raychd-net`) so the forum's
+# Node backend can reach the IRC server by its service name (`raychd`)
+# instead of a hardcoded IP, and nothing is exposed to the host except the
+# ports you explicitly map below.
+#
+# Usage:
+#   docker compose up -d              # start everything
+#   docker compose up -d raychd       # start just the IRC server
+#   docker compose logs -f raychd     # tail logs for one service
+#   docker compose down               # stop everything (keeps volumes)
+#   docker compose down -v            # stop everything AND wipe volumes
+# ---------------------------------------------------------------------------
+
+services:
+
+  # ------------------------------------------------------------------------
+  # 1. IRC server (InspIRCd)
+  # ------------------------------------------------------------------------
+  raychd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raychd:latest
+    container_name: raychd
+    restart: unless-stopped
+    ports:
+      - "6667:6667"   # plaintext IRC — fine for LAN/dev, avoid on the public internet
+      - "6697:6697"   # TLS IRC — use this one for anything public-facing
+    environment:
+      # Passed through in case your inspircd.conf reads them via <define>
+      TZ: "Asia/Manila"
+    volumes:
+      - ./inspircd.conf:/etc/inspircd/inspircd.conf:ro
+      - raychd-logs:/var/log/inspircd
+    networks:
+      - raychd-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6667"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ------------------------------------------------------------------------
+  # 2. Forum backend (Node.js API + PHP/SQLite forum)
+  # ------------------------------------------------------------------------
+  raychd-forum:
+    build:
+      context: ./forum
+      dockerfile: Dockerfile
+    image: raychd-forum:latest
+    container_name: raychd-forum
+    restart: unless-stopped
+    depends_on:
+      raychd:
+        condition: service_healthy
+    ports:
+      - "3000:3000"   # Node.js API (express)
+      - "8081:80"     # PHP forum frontend
+    environment:
+      NODE_ENV: production
+      IRC_HOST: raychd          # reach the IRC server by its service name
+      IRC_PORT: 6667
+      DB_PATH: /data/forum.sqlite
+      SESSION_SECRET: "${FORUM_SESSION_SECRET:-change-me-in-.env}"
+    volumes:
+      - raychd-forum-data:/data
+    networks:
+      - raychd-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ------------------------------------------------------------------------
+  # 3. Docs site (static, served via nginx)
+  # ------------------------------------------------------------------------
+  raychd-docs:
+    image: nginx:alpine
+    container_name: raychd-docs
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    volumes:
+      - ./docs:/usr/share/nginx/html:ro
+    networks:
+      - raychd-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+# -----------------------------------------------------------------------------
+# Shared network — keeps inter-service traffic (forum -> IRC) off the host
+# -----------------------------------------------------------------------------
+networks:
+  raychd-net:
+    driver: bridge
+
+# -----------------------------------------------------------------------------
+# Named volumes — survive `docker compose down` (but not `docker compose down -v`)
+# -----------------------------------------------------------------------------
+volumes:
+  raychd-logs:
+  raychd-forum-data:
